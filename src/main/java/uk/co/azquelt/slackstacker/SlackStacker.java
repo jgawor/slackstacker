@@ -56,7 +56,6 @@ public class SlackStacker {
 			if (config.tags == null) {
 			    config.tags = QuestionFilter.collectTags(config.filter);
 			}
-			System.out.println("Quering for tags: " + config.tags);
 
 			if (oldState != null) {
 				
@@ -68,11 +67,23 @@ public class SlackStacker {
 				
 				Calendar cutOffTime = getCutOffTime(oldState.lastUpdated);
 				
+				System.out.println("Quering for tags: " + config.tags);
 				QuestionResponse questions = getQuestions(config.tags, cutOffTime);
-                System.out.println(questions.items.size());
+                System.out.println("Updated questions: " + questions.items.size());
                 
 				List<Question> newQuestions = filterQuestions(questions.items, cutOffTime, oldState.idsSeen, config.filter);
-				//postQuestions(newQuestions, config.slackWebhookUrl);
+				if (newQuestions.isEmpty()) {
+				    System.out.println("No new questions found.");
+				} else {
+				    if (config.slackWebhookUrl != null) {
+				        postQuestions(newQuestions, config.slackWebhookUrl);
+				    } else {
+				        for (int i = 0 ; i < newQuestions.size(); i++) {
+				            Question question = newQuestions.get(i);
+				            System.out.println( (i+1) + ". " + question.title + " " + question.tags);
+				        }
+				    }
+				}
                				
 				State newState = createNewState(now, questions.items);
 				if (questions.backoff > 0) {
