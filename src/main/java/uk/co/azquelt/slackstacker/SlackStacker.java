@@ -2,6 +2,7 @@ package uk.co.azquelt.slackstacker;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URLDecoder;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
@@ -22,6 +23,7 @@ import org.apache.cxf.transport.common.gzip.GZIPFeature;
 import com.fasterxml.jackson.core.JsonGenerationException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.jaxrs.json.JacksonJsonProvider;
 
@@ -37,7 +39,7 @@ public class SlackStacker {
 			.register(JacksonJsonProvider.class) // Allow us to serialise JSON <-> POJO
 			.register(GZIPFeature.class) // Allow us to understand GZIP compressed pages
 			.build();
-
+   
 	public static void main(String[] args) throws IOException {
 		
 		try {
@@ -48,22 +50,33 @@ public class SlackStacker {
 			Config config = loadConfig(arguments.getConfigFile());
 			
 			State oldState = loadState(config.stateFile);
-			Calendar now = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+			Calendar now = getCalendar();
 			
+			// if no tags - assume filter is specified
+			if (config.tags == null) {
+			    config.tags = QuestionFilter.collectTags(config.filter);
+			}
+			System.out.println("Quering for tags: " + config.tags);
+
 			if (oldState != null) {
 				
 				if (oldState.backoffUntil != null && now.before(oldState.backoffUntil)) {
 					// We've been asked by the StackExchange API to back off, don't run
+				    System.out.println("StackExchange requested to back off");
 					return;
 				}
 				
-				QuestionResponse questions = getQuestions(config.tags);
-				List<Question> newQuestions = filterOldQuestions(questions.items, oldState.lastUpdated, oldState.idsSeen);
-				postQuestions(newQuestions, config.slackWebhookUrl);
+				Calendar cutOffTime = getCutOffTime(oldState.lastUpdated);
 				
+				QuestionResponse questions = getQuestions(config.tags, cutOffTime);
+                System.out.println(questions.items.size());
+                
+				List<Question> newQuestions = filterQuestions(questions.items, cutOffTime, oldState.idsSeen, config.filter);
+				//postQuestions(newQuestions, config.slackWebhookUrl);
+               				
 				State newState = createNewState(now, questions.items);
 				if (questions.backoff > 0) {
-					Calendar backoffUntil = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+					Calendar backoffUntil = getCalendar();
 					backoffUntil.add(Calendar.SECOND, questions.backoff);
 					newState.backoffUntil = backoffUntil;
 				}
@@ -117,47 +130,78 @@ public class SlackStacker {
 		}
 	}
 
-	private static List<Question> filterOldQuestions(List<Question> questions, Calendar lastUpdated, List<String> idsSeen) {
-		
-		// Sometimes questions don't appear in the API immediately
-		// Add an additional 30 minutes of leeway
-		Calendar cutoffTime = (Calendar) lastUpdated.clone();
-		cutoffTime.add(Calendar.MINUTE, -30);
-		
+	private static List<Question> filterQuestions(List<Question> questions, Calendar lastUpdated, List<String> idsSeen, JsonNode filter) {
 		List<Question> newQuestions = new ArrayList<>();
 		for (Question question : questions) {
-			if (!question.last_activity_date.before(cutoffTime) && !idsSeen.contains(question.question_id)) {
+		    if (question.last_activity_date.before(lastUpdated)) {
+		        continue;
+		    }
+		    if (idsSeen.contains(question.question_id)) {
+		        continue;
+		    }
+		    System.out.println(question.title + " " + question.tags);
+		    if (filter == null || QuestionFilter.evaluate(question.tags, filter)) {
+		        System.out.println("  yes");
 				newQuestions.add(question);
+			} else {
+			    System.out.println("  no");
 			}
 		}
 		return newQuestions;
 	}
 
-	private static QuestionResponse getQuestions(List<String> tags) throws IOException {
-		
-		WebTarget target = client.target("http://api.stackexchange.com/2.2");
-		WebTarget questionTarget = target.path("search")
+	private static QuestionResponse getQuestions(List<String> tags, Calendar lastUpdated) throws IOException {
+		List<Question> items = new ArrayList<Question>();
+		long startDate = lastUpdated.getTimeInMillis() / 1000; // convert to seconds
+		int page = 1;
+        while (true) {
+            WebTarget target = client.target("http://api.stackexchange.com/2.2");
+            WebTarget questionTarget = target.path("search")
 				.queryParam("order", "desc")
 				.queryParam("sort", "creation")
 				.queryParam("site", "stackoverflow")
+				.queryParam("fromdate", startDate)
+				.queryParam("page", page)
 				.queryParam("tagged", joinTags(tags));
 		
-		Invocation.Builder builder = questionTarget.request();
-		builder.accept(MediaType.APPLICATION_JSON);
-		builder.acceptEncoding("UTF-8");
+            Invocation.Builder builder = questionTarget.request();
+            builder.accept(MediaType.APPLICATION_JSON);
+		    builder.acceptEncoding("UTF-8");
 		
-		Response response = builder.get();
+		    Response response = builder.get();
 		
-		if (response.getStatus() == 200) {
-			QuestionResponse questionResponse = response.readEntity(QuestionResponse.class);
-			return questionResponse;
-		} else {
-			System.out.println("Response: " + response.getStatus());
-			String string = response.readEntity(String.class);
-			throw new IOException("Getting questions failed. RC: " + response.getStatus() + " Response: " + string);
-		}
+		    if (response.getStatus() == 200) {
+		        QuestionResponse questionResponse = response.readEntity(QuestionResponse.class);
+		        items.addAll(questionResponse.items);
+		        if (questionResponse.has_more && questionResponse.backoff == 0) {
+		            page++;
+		        } else {
+		            QuestionResponse r = new QuestionResponse();
+		            r.setItems(items);
+		            r.backoff = questionResponse.backoff;
+		            return r;
+		        }
+		    } else {
+		        System.out.println("Response: " + response.getStatus());
+		        String string = response.readEntity(String.class);
+		        throw new IOException("Getting questions failed. RC: " + response.getStatus() + " Response: " + string);
+		    }
+        }
 	}
 	
+    private static Calendar getCalendar() {
+        Calendar now = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+        return now;
+    }
+    
+    private static Calendar getCutOffTime(Calendar lastUpdated) {
+        // Sometimes questions don't appear in the API immediately
+        //  Add an additional 30 minutes of leeway
+        Calendar cutoffTime = (Calendar) lastUpdated.clone();
+        cutoffTime.add(Calendar.MINUTE, -30);
+        return cutoffTime;
+    }
+    
 	/**
 	 * Joins a list of tags into a semi-colon separated string
 	 */

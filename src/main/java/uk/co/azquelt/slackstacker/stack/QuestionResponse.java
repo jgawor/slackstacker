@@ -20,5 +20,7 @@ public class QuestionResponse {
 	public int backoff = 0;
 	
 	public int quota_remaining;
-	
+
+    public boolean has_more;
+
 }
